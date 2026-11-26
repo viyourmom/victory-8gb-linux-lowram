@@ -280,6 +280,23 @@ unsafe impl Send for Pass {}
 unsafe impl Sync for Pass {}
 
 fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
+    // Wine's `d3dcompiler_47` refuses this shader with `0x80004005` and no
+    // message, as it does the compare's and the depth plane's: `dxcompiler.dll`
+    // beside the executable compiles it (`crate::host::dxc_compile`), and the
+    // system compiler is the fallback where DXC is missing.
+    let code = match crate::host::dxc_compile(SOURCE, "main", "cs_6_0") {
+        Ok(code) => code,
+        Err(e) => {
+            tracing::info!(error = %e, "the ambient light's shader was refused; trying the system compiler");
+            system_compile()?
+        }
+    };
+    finish(device, &code)
+}
+
+/// The shader through the system's compiler (`d3dcompiler_47`), Shader Model
+/// 5.1, where `dxcompiler.dll` is not there.
+fn system_compile() -> windows::core::Result<Vec<u8>> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -309,7 +326,12 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
         }
         return Err(e);
     }
-    let code = text(&code.ok_or_else(windows::core::Error::empty)?);
+    Ok(text(&code.ok_or_else(windows::core::Error::empty)?))
+}
+
+/// The root signature and the pipeline, from compiled shader bytes.
+fn finish(device: &ID3D12Device, code: &[u8]) -> windows::core::Result<Pass> {
+    let code = code.to_vec();
     // SAFETY: the root signature is inside the shader; plain creations.
     unsafe {
         let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
