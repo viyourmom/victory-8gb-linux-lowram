@@ -616,3 +616,83 @@ isolate decode from upload.
 2. Then the CPU levers in H3 order: the 190k-slot heap pass, then the 301 MB of
    plain copies, then the texture worker's 48.7 ms.
 3. In parallel, the dark/blurry hunt in H5.
+
+## Session 5: the dark image has a cause, and a floor under it
+
+### 5.1 main is the lean branch
+`exp/lean-windows-fps` became `main` (`a136761`), force-pushed with a lease after
+checking that burner's three extra commits were upstream `meeyao` work (one is
+the patch series already ported, the other two cancel out). The old remote tip
+is kept as `backup/burner-main-pre-promote` (`b83b48b`).
+`wip/rtx3070-16gb-linux` (`69cca8a`) is untouched.
+
+### 5.2 Runs 10 and 11: both cut short
+Both were closed by hand (a controller disconnect froze the first, the second
+was ended when its ambient pass turned out not to have compiled). Numbers are
+gate readings, not end-of-run ones, so they are only comparable to each other
+at the gate.
+
+| run | build | gate | peak | end | fps | draws at gate | `copies` |
+|---|---|---|---|---|---|---|---|
+| 09 | lean | 222 s, 14,753 MB, VRAM 3,280 | 17,422 MB @478 s | 14,559 MB | 2.0 | 6,158 | — |
+| 10 | + fold | 124 s, 14,856 MB, VRAM 3,596 | — | — | — | 2,190 | — |
+| 10b | + fold | 194 s, 15,407 MB, VRAM 3,342 | 17,139 MB @388 s | — | 1.8 | 5,259 | 110.9 ms, 296 MB |
+| 12 | + ambient (live) | 194 s, 15,407 MB, VRAM 3,342 | 17,139 MB @388 s | — | 1.8 | 5,259 | 110.9 ms, 296 MB |
+
+Across all of them the shape is the same: gate around 15 GB, peak around 17 GB,
+fps under 2, `copies` over 100 ms a frame. The fold patch does not move the
+gate in either direction that this sample can resolve.
+
+### 5.3 What neptune's 11-25 build has that ours does not
+From `NEPTUNE-README.txt` and a diff of env knobs: 281 knobs there, 247 here,
+105 missing. The ones that matter, by what they touch:
+
+| where the time goes (run 09 census) | knobs neptune has |
+|---|---|
+| heap sync, 23.9 ms over 190,464 slots | `DECLARE_ONCE`, `TABLES_BY_CONTENT`, `TABLE_BUFFERS_LEFT`, `READY_TABLES`, `HEAP_SYNC_BLOCKS`, `BIND_CACHE` |
+| texture worker, 48.7 ms (8.1 detiling) | `TEXTURE_CATCH_UP_MS`, `TEXTURE_BACK*`, `KEEP_OTHER_VIEWS`, `TEXTURE_HEAPS` |
+| copies, 301 MB a frame | `FAST_COPY`, `CARD_COPIES`, `TITLE_COPY_PLAIN`, `WIDE_FILLS`, `ALIAS_RUNS` |
+| relay idle, 64.8 ms | `RELAY_KEPT_PIECES`, `RELAY_OWN_QUEUE` |
+| recording | `THIN`, `THIN_THREADS` |
+| RAM pools | `LIST_POOL_MB`, `STAGE_POOL_MB`, `TEXTURE_POOL_MB` |
+| VRAM pressure | `VRAM_EVICT`, `VRAM_IDLE_MS`, `VRAM_IDLE_BY_ROOM`, `SLOT_EVICT*` |
+
+`LIST_POOL_MB` is the one that goes at the 12 GB target directly; `DECLARE_ONCE`
+and `TEXTURE_CATCH_UP_MS` are the two largest CPU items.
+
+### 5.4 The dark image: the title's indirect light never runs
+The title fills its indirect diffuse light from probes it traces; the resolve
+(`CS_ScreenProbes_TemporalResolve`) writes almost nothing here, so everything
+the sun does not reach is black. Neptune's build raises that resolve's output to
+a constant and runs the pass again. Ported as `crates/victory-gpu/src/ambient.rs`
+(`4fc04a3`), trimmed: no sky-follow and no reflection-hold, because both need the
+sky's host copy handed to the list (`HostList::transition_copy`), which this fork
+does not have.
+
+Two things were needed to make it run at all:
+- the module has to be behind `#[cfg(windows)]`, not the diagnostics cfg it first
+  landed under;
+- Wine's `d3dcompiler_47` refuses the shader with `0x80004005` and no message,
+  the same way it refuses the compare's and the depth plane's, so it compiles
+  through `crate::host::dxc_compile` (Shader Model 6.0) first (`a9893a5`).
+
+Run 12 confirms it: `ambient light level=0.6 width=1280 height=720`, one line, no
+`ERROR`. The level is `VICTORY_AMBIENT` (0.6 default, `off` for the title's own
+output), crease shading is `VICTORY_AMBIENT_SHADE=s,r,n,t`. It costs no
+measurable time: the pass is one dispatch at 1280×720.
+
+"Blurry" is separate and expected: the Series S profile renders 720p and lets
+the title's own upscaler stretch it (`UPSCALER_6`). Only the Series X 4K profile
+is sharper, and that one does not fit 8 GB yet.
+
+### 5.5 Scripted keys
+`VICTORY_KEYS` now presses Enter from 12 s to 110 s, not just to 60 s: the menu
+comes up later than it used to after a cold start, and a missed Enter sits on it
+until the run's timeout.
+
+### 5.6 Next, in the order the census says
+1. `DECLARE_ONCE` + `TABLES_BY_CONTENT`: the 190,464-slot heap pass is the
+   biggest single item at 23.9 ms.
+2. `TEXTURE_CATCH_UP_MS` + `TEXTURE_BACK*`: 48.7 ms, and it is also the reason
+   props pop in late.
+3. `LIST_POOL_MB`: the only lever pointed straight at the gate.
