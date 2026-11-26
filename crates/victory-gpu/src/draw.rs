@@ -2321,6 +2321,50 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        // The indirect light the title traces is black here: raise what its
+        // resolve just wrote to a floor, in this list, then run the pass
+        // again so the title's own shading reads it (`crate::ambient`).
+        if self.ambient(list, p) {
+            self.replay(list);
+        }
+    }
+
+    /// Raises the title's indirect diffuse light to a floor, in `list`, when
+    /// the dispatch just run is the program that resolves it
+    /// (`crate::ambient::PROGRAM`). Whether the dispatch must run again for
+    /// the title's shading to see the change.
+    /// shortcut: the light is the same everywhere, from everywhere, and does
+    /// not follow the sky; gone once the title's rays run (`VICTORY_AMBIENT=off`,
+    /// or 0 for none).
+    fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
+        let Some(stage) = p.stages.first() else { return false };
+        if !stage.shader.resolves_light() {
+            return false;
+        }
+        let view = |kind: ResourceType, (slot, dwords): (u8, u32)| -> Option<View> {
+            let u = stage
+                .translated()
+                .used
+                .iter()
+                .find(|u| u.kind == kind && (u.slot, u.table_offset_dwords) == (slot, dwords))?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
+            Some(View::Unordered(r, ..)) => r,
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no ambient light: the resolve's table has no light");
+            return false;
+        }
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report

@@ -67,6 +67,10 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Whether its code resolves the indirect light the title traces, once
+    /// looked at ([`Shader::resolves_light`]).
+    #[cfg(windows)]
+    resolves_light: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +123,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                resolves_light: OnceLock::new(),
             })
         })
         .clone()
@@ -277,6 +282,24 @@ impl Shader {
     fn walks(&self) -> bool {
         *self.walks.get_or_init(|| container_walks(&self.container))
     }
+
+    /// Whether its code is the program that resolves the indirect diffuse
+    /// light (`crate::ambient`), which is left without light here until
+    /// something stands in for its traced probes.
+    #[cfg(windows)]
+    pub(crate) fn resolves_light(&self) -> bool {
+        *self
+            .resolves_light
+            .get_or_init(|| container_has(&self.container, crate::ambient::PROGRAM))
+    }
+}
+
+/// Whether a console container's bytes hold `program` anywhere: the names
+/// of the programs it was built from are in them, and a start of a name is
+/// enough to know which program it is.
+#[cfg(windows)]
+fn container_has(container: &[u8], program: &[u8]) -> bool {
+    container.windows(program.len()).any(|w| w == program)
 }
 
 /// Whether a console container's code tests rays against the nodes of a
