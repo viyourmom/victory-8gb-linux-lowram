@@ -32,7 +32,9 @@ GAME=$(cd "$(dirname "$GAME")" && pwd)/$(basename "$GAME")
 [ -f "$GAME" ] || { echo "not found: $GAME" >&2; exit 1; }
 
 WINE="$PROTON/files/bin/wine"
-REL="$ROOT/target/x86_64-pc-windows-msvc/release"
+# VICTORY_BUILD_DIR picks another profile's output (e.g. .../diag after
+# `cargo build --profile diag --features diagnostics`).
+REL=${VICTORY_BUILD_DIR:-"$ROOT/target/x86_64-pc-windows-msvc/release"}
 [ -x "$WINE" ] || { echo "Proton wine not found: $WINE (pass --proton)" >&2; exit 1; }
 [ -f "$REL/victory.exe" ] || { echo "not built: run ./scripts/setup-linux.sh first" >&2; exit 1; }
 [ -f "$REL/dxcompiler.dll" ] || { echo "dxcompiler.dll missing beside victory.exe; rerun setup with --dxc" >&2; exit 1; }

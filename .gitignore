@@ -76,3 +76,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# vkd3d-proton drops its shader cache in the working directory each run
+vkd3d-proton.cache*

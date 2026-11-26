@@ -140,20 +140,92 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     }
 }
 
+/// The memory pressure the sweeps answer to: the available RAM below which
+/// they are moderate and aggressive, and the working set at or above which
+/// they are aggressive whatever the system says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RamLimits {
+    /// Below this, idle timeouts halve.
+    pub(crate) moderate: u64,
+    /// Below this, they are at their shortest.
+    pub(crate) aggressive: u64,
+    /// The process's working set at or above this: at their shortest, even if
+    /// the system still reports room (on a 16 GB host it reports that while
+    /// the title's page pool is already paged in).
+    pub(crate) rss: u64,
+}
+
+impl Default for RamLimits {
+    fn default() -> Self {
+        // A 16 GB host holds the title's page pool and our copies at once:
+        // 4 GB free and 2 GiB bands were late to react, and run 07's 30
+        // minutes fell to 340 MB free with windows still held.
+        RamLimits {
+            moderate: 8 << 30,
+            aggressive: 4 << 30,
+            rss: 10 << 30,
+        }
+    }
+}
+
+/// The limits in force: `VICTORY_RAM_MODERATE_MB` (8192),
+/// `VICTORY_RAM_FLOOR_MB` (4096) and `VICTORY_RAM_IDLE_RSS_MB` (10240).
+fn ram_limits() -> RamLimits {
+    static LIMITS: OnceLock<RamLimits> = OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let mb = |name: &str, default_mb: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default_mb)
+                << 20
+        };
+        let default = RamLimits::default();
+        RamLimits {
+            moderate: mb("VICTORY_RAM_MODERATE_MB", default.moderate >> 20),
+            aggressive: mb("VICTORY_RAM_FLOOR_MB", default.aggressive >> 20),
+            rss: mb("VICTORY_RAM_IDLE_RSS_MB", default.rss >> 20),
+        }
+    })
+}
+
+/// The process's working set (what the system counts as resident): the
+/// pressure the idle timeouts answer to besides free RAM.
+pub(crate) fn working_set() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    c.WorkingSetSize as u64
+}
+
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
-/// when free physical RAM is low. Never returns less than 2,000 ms.
+/// when free physical RAM is low or the process's working set is already
+/// large. Never returns less than 2,000 ms.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
-    const GIB: u64 = 1024 * 1024 * 1024;
+    ram_idle_ms_with(avail_phys, working_set(), ram_limits())
+}
+
+/// [`ram_idle_ms`] for given measurements and limits (the test's entry).
+pub(crate) fn ram_idle_ms_with(avail_phys: Option<u64>, working: u64, limits: RamLimits) -> u64 {
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
+    if working >= limits.rss {
+        return HIGH_MS;
+    }
     let Some(avail) = avail_phys else {
         return NORMAL_MS;
     };
-    if avail < 2 * GIB {
+    if avail < limits.aggressive {
         HIGH_MS
-    } else if avail < 4 * GIB {
+    } else if avail < limits.moderate {
         MODERATE_MS
     } else {
         NORMAL_MS
@@ -1090,6 +1162,78 @@ pub(crate) fn compile(
     Ok(bytes.to_vec())
 }
 
+/// Compiles function `entry` of `source` for `target` with DXC, loaded from
+/// `dxcompiler.dll` beside the executable. Wine's `d3dcompiler_47` refuses
+/// some of our shaders (the indirect clamp's `InterlockedAdd` is one; the
+/// depth plane's pipeline and the card compare are the others, each a
+/// `0x80004005` with no compiler message). `target` must be a Shader Model
+/// 6 profile (`ps_6_0`, `cs_6_0`): DXC compiles nothing below it.
+pub(crate) fn dxc_compile(
+    source: &str,
+    entry: &str,
+    target: &str,
+) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::Dxc::*;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::core::{Interface, PCWSTR, s, w};
+    type Create = unsafe extern "system" fn(
+        *const windows::core::GUID,
+        *const windows::core::GUID,
+        *mut *mut std::ffi::c_void,
+    ) -> windows::core::HRESULT;
+    let target = windows::core::HSTRING::from(target);
+    let entry = windows::core::HSTRING::from(entry);
+    // SAFETY: loading the compiler and calling its documented entry point
+    // with out pointers of ours; the buffer and arguments outlive the calls.
+    unsafe {
+        let library = LoadLibraryW(w!("dxcompiler.dll"))?;
+        let create: Create = std::mem::transmute(
+            GetProcAddress(library, s!("DxcCreateInstance"))
+                .ok_or_else(windows::core::Error::from_thread)?,
+        );
+        let mut raw = std::ptr::null_mut();
+        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut raw).ok()?;
+        let compiler = IDxcCompiler3::from_raw(raw);
+        let buffer = DxcBuffer {
+            Ptr: source.as_ptr().cast(),
+            Size: source.len(),
+            Encoding: DXC_CP_UTF8.0,
+        };
+        let arguments: [PCWSTR; 5] = [
+            w!("-T"),
+            PCWSTR(target.as_ptr()),
+            w!("-E"),
+            PCWSTR(entry.as_ptr()),
+            w!("-O3"),
+        ];
+        let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
+        result.GetStatus()?.ok()?;
+        let blob = result.GetResult()?;
+        Ok(
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                .to_vec(),
+        )
+    }
+}
+
+/// Compiles `entry` of `source` with the system's compiler in Shader Model
+/// 5.1, or with DXC in the Shader Model 6 profile `six` when `dxc` is set:
+/// the fallback for shaders the system compiler's pipeline is refused for.
+fn compile_either(
+    source: &str,
+    entry5: windows::core::PCSTR,
+    target5: windows::core::PCSTR,
+    entry6: &str,
+    target6: &str,
+    dxc: bool,
+) -> windows::core::Result<Vec<u8>> {
+    if dxc {
+        dxc_compile(source, entry6, target6)
+    } else {
+        compile(source, entry5, target5)
+    }
+}
+
 impl PlanePass {
     /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
     /// or of floats and the depth format `format`.
@@ -1115,11 +1259,57 @@ impl PlanePass {
     }
 
     fn make(steps: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
+        // The system compiler's pipeline is refused under Wine for these
+        // shaders (0x80004005 with no compiler message): DXC's Shader Model
+        // 6 output is the same fallback that spares the indirect clamp.
+        Self::make_with(steps, format, false).or_else(|e| {
+            tracing::info!(
+                error = %e,
+                steps,
+                format = format.0,
+                "the system compiler's depth plane pipeline was refused; trying DXC"
+            );
+            Self::make_with(steps, format, true)
+        })
+    }
+
+    fn make_with(
+        steps: bool,
+        format: DXGI_FORMAT,
+        dxc: bool,
+    ) -> windows::core::Result<PlanePipeline> {
         use windows::core::s;
         let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-        let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
+        let stop = |stage: &'static str, e: windows::core::Error| {
+            tracing::warn!(
+                error = %e,
+                stage,
+                dxc,
+                steps,
+                format = format.0,
+                "the depth plane pipeline stopped"
+            );
+            e
+        };
+        let vs = compile_either(
+            PLANE_CORNERS,
+            s!("corner"),
+            s!("vs_5_1"),
+            "corner",
+            "vs_6_0",
+            dxc,
+        )
+        .map_err(|e| stop("the corner shader", e))?;
         let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
-        let ps = compile(source, s!("plane"), s!("ps_5_1"))?;
+        let ps = compile_either(
+            source,
+            s!("plane"),
+            s!("ps_5_1"),
+            "plane",
+            "ps_6_0",
+            dxc,
+        )
+        .map_err(|e| stop("the plane shader", e))?;
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
@@ -1127,7 +1317,9 @@ impl PlanePass {
         // SAFETY: the root signature is inside the pixel shader; the
         // description points at live data and never releases its pointer.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let root: ID3D12RootSignature = device
+                .CreateRootSignature(0, &ps[..])
+                .map_err(|e| stop("the root signature", e))?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
@@ -1154,7 +1346,9 @@ impl PlanePass {
                 },
                 ..Default::default()
             };
-            let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
+            let pipeline: ID3D12PipelineState = device
+                .CreateGraphicsPipelineState(&desc)
+                .map_err(|e| stop("the graphics pipeline", e))?;
             Ok((root, pipeline))
         }
     }
@@ -4125,46 +4319,46 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        // The system compiler's compare pipeline is refused under Wine
+        // (0x80004005 with no compiler message): retry with DXC's Shader
+        // Model 6 output, as the indirect clamp does.
+        self.make_card_work_with(false).or_else(|e| {
+            tracing::info!(
+                error = %e,
+                "the system compiler's compare pipeline was refused; trying DXC"
+            );
+            self.make_card_work_with(true)
+        })
+    }
+
+    fn make_card_work_with(&self, dxc: bool) -> windows::core::Result<CardWork> {
+        use windows::core::s;
+        let stop = |stage: &'static str, e: windows::core::Error| {
+            tracing::warn!(error = %e, stage, dxc, "the compare pipeline stopped");
+            e
+        };
+        let code = compile_either(CARD_COMPARE, s!("main"), s!("cs_5_1"), "main", "cs_6_0", dxc)
+            .map_err(|e| stop("the compare shader", e))?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
+        // SAFETY: the root signature is inside the shader; the description
+        // points at live data and never releases its pointer.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let root: ID3D12RootSignature = self.device
+                .CreateRootSignature(0, &code[..])
+                .map_err(|e| stop("the root signature", e))?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
                 },
                 ..Default::default()
-            })?;
+            }).map_err(|e| stop("the compute pipeline", e))?;
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
@@ -9062,19 +9256,31 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn ram_idle_ms_scales_with_pressure() {
-        use super::ram_idle_ms;
+        use super::{RamLimits, ram_idle_ms_with};
         let gib = 1024 * 1024 * 1024;
-        // Normal (>= 4 GiB)
-        assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
-        assert_eq!(ram_idle_ms(Some(4 * gib)), 10_000);
-        // Moderate (2 GiB..4 GiB)
-        assert_eq!(ram_idle_ms(Some(4 * gib - 1)), 5_000);
-        assert_eq!(ram_idle_ms(Some(2 * gib)), 5_000);
-        // High (< 2 GiB)
-        assert_eq!(ram_idle_ms(Some(2 * gib - 1)), 2_000);
-        assert_eq!(ram_idle_ms(Some(0)), 2_000);
-        // Missing falls back to normal
-        assert_eq!(ram_idle_ms(None), 10_000);
+        // The old bands, as an explicit setting: 4 GiB and 2 GiB.
+        let old = RamLimits {
+            moderate: 4 * gib,
+            aggressive: 2 * gib,
+            rss: u64::MAX,
+        };
+        assert_eq!(ram_idle_ms_with(Some(8 * gib), 0, old), 10_000);
+        assert_eq!(ram_idle_ms_with(Some(4 * gib), 0, old), 10_000);
+        assert_eq!(ram_idle_ms_with(Some(4 * gib - 1), 0, old), 5_000);
+        assert_eq!(ram_idle_ms_with(Some(2 * gib), 0, old), 5_000);
+        assert_eq!(ram_idle_ms_with(Some(2 * gib - 1), 0, old), 2_000);
+        assert_eq!(ram_idle_ms_with(Some(0), 0, old), 2_000);
+        assert_eq!(ram_idle_ms_with(None, 0, old), 10_000);
+        // The defaults are tighter for a 16 GB host: 8 GiB and 4 GiB.
+        let now = RamLimits::default();
+        assert_eq!(ram_idle_ms_with(Some(9 * gib), 0, now), 10_000);
+        assert_eq!(ram_idle_ms_with(Some(6 * gib), 0, now), 5_000);
+        assert_eq!(ram_idle_ms_with(Some(3 * gib), 0, now), 2_000);
+        // A working set already at the limit is aggressive whatever the system
+        // reports, and wins over a roomy `avail`.
+        assert_eq!(ram_idle_ms_with(Some(9 * gib), 10 * gib, now), 2_000);
+        assert_eq!(ram_idle_ms_with(None, 12 * gib, now), 2_000);
+        assert_eq!(ram_idle_ms_with(Some(9 * gib), 10 * gib - 1, now), 10_000);
     }
 }
 

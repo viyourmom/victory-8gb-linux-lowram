@@ -29,7 +29,6 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Dxc::*;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -247,44 +246,11 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     make_from(device, SOURCE)
 }
 
-/// Compiles `source` as `cs_6_0` with DXC, loaded from `dxcompiler.dll`
-/// beside the executable: Wine's d3dcompiler_47 rejects the clamp's
-/// `InterlockedAdd` (E5005), and without a clamp every indirect draw is
-/// dropped. From VIctory's tree.
+/// Compiles `source` as `cs_6_0` with DXC: Wine's d3dcompiler_47 rejects
+/// the clamp's `InterlockedAdd` (E5005), and without a clamp every indirect
+/// draw is dropped. The loader lives in [`crate::host::dxc_compile`].
 fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    use windows::core::{Interface, w};
-    type Create = unsafe extern "system" fn(
-        *const windows::core::GUID,
-        *const windows::core::GUID,
-        *mut *mut std::ffi::c_void,
-    ) -> windows::core::HRESULT;
-    // SAFETY: loading the compiler and calling its documented entry point
-    // with out pointers of ours; the buffer and arguments outlive the calls.
-    unsafe {
-        let library = LoadLibraryW(w!("dxcompiler.dll"))?;
-        let create: Create = std::mem::transmute(
-            GetProcAddress(library, s!("DxcCreateInstance"))
-                .ok_or_else(windows::core::Error::from_thread)?,
-        );
-        let mut raw = std::ptr::null_mut();
-        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut raw).ok()?;
-        let compiler = IDxcCompiler3::from_raw(raw);
-        let buffer = DxcBuffer {
-            Ptr: source.as_ptr().cast(),
-            Size: source.len(),
-            Encoding: DXC_CP_UTF8.0,
-        };
-        let arguments: [windows::core::PCWSTR; 5] =
-            [w!("-T"), w!("cs_6_0"), w!("-E"), w!("main"), w!("-O3")];
-        let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
-        result.GetStatus()?.ok()?;
-        let blob = result.GetResult()?;
-        Ok(
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-                .to_vec(),
-        )
-    }
+    crate::host::dxc_compile(source, "main", "cs_6_0")
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it

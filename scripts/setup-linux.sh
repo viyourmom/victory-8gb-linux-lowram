@@ -57,6 +57,12 @@ for f in d3d12.dll d3d12core.dll; do
   cp -f "$PROTON/files/lib/wine/vkd3d-proton/x86_64-windows/$f" "$SYS/$f"
 done
 cp -f "$PROTON/files/lib/wine/dxvk/x86_64-windows/dxgi.dll" "$SYS/dxgi.dll"
+# vkd3d-proton's own libvkd3d-* DLLs: d3d12.dll loads them from system32
+# beside itself, and Wine's builtin copies are a different version. Without
+# these a fresh prefix fails to create the device.
+for f in libvkd3d-1.dll libvkd3d-shader-1.dll libvkd3d-utils-1.dll; do
+  cp -f "$PROTON/files/lib/vkd3d/x86_64-windows/$f" "$SYS/$f"
+done
 
 # A prefix made by Proton keeps absolute symlinks into the Proton folder.
 # Outside Proton's runtime those dangle; turn them into real files.

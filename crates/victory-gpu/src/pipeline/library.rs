@@ -452,14 +452,45 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// `CreatePipelineLibrary` that passes a null blob for an empty library, as
+/// the host requires. The safe wrapper hands over `[].as_ptr()`, which is a
+/// dangling `0x1`, and the host answers `E_INVALIDARG` for a zero length with
+/// a non-null blob — so no empty library could ever be made this way, and no
+/// pipeline was ever kept (`host-pipelines.bin` never written).
+unsafe fn create_library(
+    device: &ID3D12Device1,
+    bytes: &[u8],
+) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    use windows::core::{Interface, Type};
+    let blob = if bytes.is_empty() {
+        core::ptr::null()
+    } else {
+        bytes.as_ptr().cast()
+    };
+    let mut result = core::ptr::null_mut();
+    // SAFETY: the vtable is this device's own, the blob is read in full during
+    // the call, and `result` receives one interface of the IID asked for.
+    let called = unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            blob,
+            bytes.len(),
+            &<ID3D12PipelineLibrary1 as Interface>::IID,
+            &mut result,
+        )
+    };
+    called.ok()?;
+    // SAFETY: a successful call gives one owning reference.
+    unsafe { Type::from_abi(result) }
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
-        unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
-        }
+        // SAFETY: the bytes outlive the library (kept beside it); the empty
+        // one passes none.
+        unsafe { create_library(device, bytes) }
     };
     if !blob.bytes().is_empty() {
         match make(blob.bytes()) {
@@ -487,7 +518,20 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    let library = make(&[]).ok()?;
+    let library = match make(&[]) {
+        Ok(library) => library,
+        Err(e) => {
+            // Said here, not swallowed: without a library every pipeline is
+            // made again on every start (`host-pipelines.bin` never written,
+            // and 2,168 pipelines remade in run 07's 30 minutes).
+            tracing::warn!(
+                error = %e,
+                dir = ?DIR.get(),
+                "this device refuses an empty pipeline library: pipelines will be made again every run"
+            );
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Blob::None,
