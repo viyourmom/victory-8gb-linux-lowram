@@ -4221,6 +4221,30 @@ fn lookup(
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
+        // Folded (`VICTORY_FOLD_BUFFERS`, on unless 0): a buffer small enough
+        // for one window takes the window the title's own memory around it is
+        // already copied into, instead of a second copy of the same bytes.
+        // Two copies of one range made every submission that refreshed one
+        // while a flight's shaders wrote the other wait for the card to
+        // drain: ~2.8 times a frame in neptune's world, for 10-40 KB each
+        // (a ring, a parameter block), and the waits show up here as copy
+        // stalls. One copy's own pending writes are left alone by its own
+        // refresh, and need no such wait. The window is held by the buffer's
+        // entry too, so the sweep (`let_go_idle`) never lets it go while a
+        // buffer still points at it.
+        if !big && fold_buffers() && size <= WINDOW
+            && let Some((window, _)) = loose(key.0, entry.end, false, false, None)
+        {
+            if FOLDED.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    "a buffer's copy is its window's (VICTORY_FOLD_BUFFERS)"
+                );
+            }
+            entry.shadow = Some(window);
+            return entry.shadow.clone().map(|shadow| (shadow, false));
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone().map(|shadow| (shadow, false));
@@ -4303,6 +4327,20 @@ fn window() -> u64 {
         grid(kb)
     })
 }
+
+/// Whether a buffer that fits in one window takes the window of the title's
+/// memory it lies in as its copy, rather than a copy of its own (on by
+/// default; `VICTORY_FOLD_BUFFERS=0` gives every buffer its own copy, as
+/// before). Neptune's world measured 179.2 -> 160.1 ms a frame and settles
+/// from 4.5 to 1.0 a frame with it on.
+fn fold_buffers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FOLD_BUFFERS").is_none_or(|v| v != "0"))
+}
+
+/// Buffers that took a window as their copy since the start
+/// ([`fold_buffers`]).
+pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
 
 /// The window grid in bytes for a setting in KiB: a power of two from
 /// 64 KiB to 4 MiB, 4 MiB for anything else.
