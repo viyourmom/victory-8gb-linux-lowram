@@ -527,3 +527,92 @@ ones.
 2. Release, 600 s, same env: peak/gate RSS and FPS delta with the tighter idle
    thresholds. Expect the window sweep to engage earlier; 12,288 MB will not be
    reached by these two changes alone — the pipeline cache is the next lever.
+
+## Session 4 — run 09 (warm release), the folded-buffer patch, dark shading (2026-11-26, 02:20)
+
+### H1 the harness presses Enter through the menus
+The title sits on its "press a key" menus until someone does: the demo shows a
+static frame, RSS flat at ~4 GB, and the gate never opens. `/tmp/vgb/ramrun2.sh`
+therefore exports, before the launch:
+
+```sh
+export VICTORY_KEYS="12:Enter,16:Enter,20:Enter,25:Enter,30:Enter,35:Enter,40:Enter,45:Enter,50:Enter,60:Enter"
+```
+
+`VICTORY_KEYS` is `<second>:<key>` pairs, counted from the start of the title's
+run: one Enter lands on the first menu, the later ones clear the settings/load
+confirmation and the "continue" prompt. Add a pair for a new menu rather than
+shortening the list; a run that never gets past a menu looks exactly like a
+hang, with no draws and no VRAM. The script also keeps the run's own window
+(no `-silent`) so an Enter that lands on a menu still shows on screen.
+
+### H2 run 09 — warm cache, release, 1,800 s asked, 1,202 s run
+`09-rel-warm.*`: `GATE_MIN_T=75 GATE_STOP=0 ramrun2.sh … 1800 900 -- VICTORY_WINDOW_KB=256
+VICTORY_WINDOW_TAILS=1`, `host-pipelines.bin` left warm (26 pipelines loaded
+before the first draw). The run was ended by closing the demo window at
+t≈1,202 s; exit was clean (no `victory.exe`, no `wineserver` of ours, GPU back
+to 86 MiB).
+
+| | gate | end |
+|---|---|---|
+| when | t=222 s | t≈1,200 s |
+| RSS | 14,753 MB | 14,559 MB |
+| VRAM | 3,280 MB | 5,196 MB |
+| draws/frame | 6,158 | 5,580 |
+| fps | 0.2 | 2.0 |
+| copies in the frame | 1,290.8 ms | 97.0 ms |
+
+Peak 17,422 MB at t=478 s (the `.tsv`'s RSS column is KiB, not MB); 1,693 frame
+lines, max 7,870 draws at that peak, no ERROR line. Against run 07 (cold, gate 280 s / 14,297 MB) the warm cache buys 58 s to
+the gate and costs 456 MB there: the gate is a different shot, so **run 09 vs
+run 10 is the only comparison that means anything**.
+
+### H3 the frame time is CPU, not the card
+From the run's own census, per frame: the card is **21% busy** (`nothing of ours
+queued 298.2 ms`), so the 0.6–2.0 fps is host work. The biggest pieces:
+- `textures picked by index`, own thread (`VICTORY_HEAP_WORKER`): **48.7 ms**
+  (8.1 of it detiling), 84 slots shown;
+- descriptor heap sync: **23.9 ms**, 189 changed heap pages, **190,464 slots
+  looked at** per frame;
+- texture refreshes on the submitting thread: **22.8 ms** (13.2 asking the write
+  watch);
+- copies of title memory in place (`VICTORY_COPY_PLAIN=1`): 23,440 copies,
+  **301.2 MB** per frame;
+- shader-write compares: 37.1 MB in 366 buffer-copy ranges, 28.4 MB snapshotted;
+- the relay thread waits 64.8 ms for the card with nothing to land.
+Single frames hit `copies 2,189.6 ms 320.0 MB` — 320 MB re-copied in one frame
+at ~146 MB/s, i.e. the sources are being refaulted with ~1 GB free.
+
+### H4 the patch under test: a buffer's copy is its window's (`exp/lean-windows-fps`)
+`a540bb8`, pushed to the burner repo, `VICTORY_FOLD_BUFFERS` (on unless `0`).
+A buffer small enough for one window now takes the window the title's memory
+around it is already copied into instead of a second copy of the same bytes; the
+buffer's entry holds the window, so `let_go_idle` (which needs
+`Arc::strong_count == 1`) can never take it while a buffer points at it. From
+neptune: 179.2 → 160.1 ms a frame, settles 4.5 → 1.0 a frame. Diag, release and
+`--tests` build with the same 3 pre-existing `resource.rs` warnings, no new
+ones. **Not yet A/B'd here** — run 10 is the measurement.
+
+The 889 MB "asked for without a length" (run 08 census) is **not** reclaimable by
+trimming: a root view carries no length, so the console reads past whatever
+window we make; a shorter window would zero real mesh reads, not just the hole.
+
+### H5 open bug: the image is dark and blurry
+Reported from the run 09 session, with geometry now correct (faces render).
+Ruled out from the same run's log: no `ERROR` line; the only shader of ours that
+fails to compile is the **compare pipeline** (`Load4` on `RWByteAddressBuffer`,
+then DXC retries it), not a title pass; the 29 `a pipeline creation method that
+is not implemented` slots are the known gaps; `texture picked by index changed
+after its upload` (220×) re-uploads and is handled. `0` mentions of sRGB.
+Leading hypothesis: **tiled/UBWC decode or mip selection**, which is the one
+fault that gives dark *and* blurry at once (a wrongly detiled mip reads as
+smeared and dark). Next: compare one known texture against neptune's detile for
+the same format/level, with `VICTORY_DETILE*`/`VICTORY_TEXTURE_*` knobs to
+isolate decode from upload.
+
+### H6 next
+1. Run 10 with the same args as run 09 (`10-rel-lean.*`) once the demo is
+   reopened: gate RSS/VRAM, peak, fps, `copies … ms` against run 09.
+2. Then the CPU levers in H3 order: the 190k-slot heap pass, then the 301 MB of
+   plain copies, then the texture worker's 48.7 ms.
+3. In parallel, the dark/blurry hunt in H5.
