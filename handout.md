@@ -462,6 +462,63 @@ and the card-compare DXC fallback we already hand-ported.
   DXC path carries on; one `the depth plane pipeline stopped ... stage="the root
   signature"` warning.
 
+## Session 3 — backup, run 08 census, 3-way audit, ports (2026-11-26, 01:30)
+
+### G1 the tree is on GitHub, as the burner
+`wip/rtx3070-16gb-linux` = baseline commit `3a02bf1` (identity `viyourmom
+<burner@github>`, `core.hooksPath` unset so the policy hook does not run; the
+staged set was verified all-text). Fork `viyourmom/victory-8gb-linux` does not
+exist yet, so nothing is pushed: click Fork once, then `git push burner
+wip/rtx3070-16gb-linux`.
+
+### G2 where run 08's 1,103 MB above target lives (gate t=123 s)
+| bucket | gate | peak t=294 | end t=573 |
+|---|---|---|---|
+| working set | 13,452 | 15,852 | 15,103 |
+| private commit | 3,087 | 4,259 | 4,852 |
+| host textures | 2,160 | 2,766 | 3,226 |
+| host copies of title memory | 2,962 | 2,618 | 3,113 |
+| … of them windows outside buffers | 2,098 | 1,751 | 2,238 |
+| … of them the host renders to/writes | 779 | 1,039 | 1,379 |
+| staging of textures | 19 | 23 | 34 |
+| the card's own, in use | 2,949 | 3,689 | 4,248 |
+| the PC's shared with the card | 3,646 | 3,450 | 3,979 |
+| the PC's free RAM | 2,788 | 1,097 | 988 |
+
+The title's own resident pages at the gate are ~5,750 MB (heaps 1,823 + views
+2,926 + page pool 899 + programs 102). **The cheapest 900 MB is inside the
+windows themselves**: "of the windows alive, 889 MB lie between the lowest and
+highest address asked for in each" at the gate, 1,145 MB at the end. That is
+window area nothing reads, and it grows with `VICTORY_WINDOW_KB`; splitting a
+window at its holes is the next lever, not a new allocator.
+
+Also: `copystat`'s `the pipeline library's file 0 MB` line is wrong (it stats a
+path in the working directory, not the prefix's cache) — the file is 328 KB and
+`library.rs` logs the real saves.
+
+### G3 the depth-plane warning and the 264 ms copy
+The `stage="the root signature"` warning is the **handled** first attempt
+(`dxc=false`) of `PlanePass::make` for format 45: Wine's `d3dcompiler_47`
+rejects the DXBC root signature, the DXC retry on the next line succeeds, and it
+happens once per run (count: 1). Not a fault.
+
+The 264.2 ms for 295.7 MB is `PREPARING[0]` — CPU `Shadow::update` memcpy of
+title pages into the host copy, timed (host.rs `update` ~7680), not PCIe and not
+the GPU. Release measured the same volume at 85.8 ms (3.3 GB/s) in run 07; the
+diag build times `copystat::range` inside that region, and with 966 MB free the
+sources are being refaulted. Fix the window set, not the copy loop.
+
+### G4 what was ported (`exp/merges-nvidia-neptune`, 4 commits)
+`d97c81d` typed buffer views take the float format of the same width
+(`bit_exact_format`); `9047d43` signature rows share one interpolation mode;
+`5cb2a64` `v_div_fixup` keeps a qNaN quotient below signed zero; `cb01b1e` a
+helper lane's `v_readfirstlane` takes its own value. All from
+meeyao/victory-8gb-linux `710b7e4` (upstream `origin/main` is now `b83b48b`,
+which **reverted** `6b385bd` "Textures wait for title memory: the missing
+head" — so `VICTORY_TEXTURE_NO_WAIT` stays 1 here). Diag, release and `--tests`
+build with the same 3 pre-existing `resource.rs` dead-code warnings, no new
+ones.
+
 ### F7 next two runs (not yet launched)
 1. `/tmp/vgb/ramrun2.sh /tmp/vgb/08-diag-gated.log 600 900 -- VICTORY_WINDOW_KB=256
    VICTORY_WINDOW_TAILS=1 VICTORY_BUILD_DIR=<repo>/target/x86_64-pc-windows-msvc/diag`
